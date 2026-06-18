@@ -91,7 +91,7 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
 
   # Skip blank lines and comment lines
   [[ -z "${url// }" || "$url" == \#* ]] && continue
-  ((total++))
+  total=$((total + 1))
 
   owner_repo=$(extract_owner_repo "$url")
   owner="${owner_repo%%/*}"
@@ -104,10 +104,7 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
   # ── Repo info (default branch, visibility) ──────────────────────────────────
   if ! repo_json=$(gh_api "/repos/${owner_repo}" 2>/dev/null); then
     echo -e "   ${RED}✗  Failed to fetch repo — check token scope or repo name${RESET}"
-    ((failed++)); continue
-  fi
-
-  default_branch=$(echo "$repo_json" | jq -r '.default_branch')
+    failed=$((failed + 1)); continue=$(echo "$repo_json" | jq -r '.default_branch')
   visibility=$(echo "$repo_json"     | jq -r '.visibility')
 
   echo -e "   ${GREEN}Default branch:${RESET}  ${BOLD}${default_branch}${RESET}  ${DIM}[${visibility}]${RESET}"
@@ -115,10 +112,7 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
   # ── Branch list ─────────────────────────────────────────────────────────────
   if ! branches_json=$(gh_api "/repos/${owner_repo}/branches?per_page=100" 2>/dev/null); then
     echo -e "   ${YELLOW}⚠  Could not fetch branch list${RESET}"
-    ((failed++)); continue
-  fi
-
-  branch_count=$(echo "$branches_json" | jq 'length')
+    failed=$((failed + 1)); continue=$(echo "$branches_json" | jq 'length')
   branch_names=$(echo "$branches_json" | jq -r '.[].name')
   echo -e "   ${GREEN}Total branches:${RESET}   ${branch_count}"
 
@@ -133,7 +127,7 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
     # A 404 means no protection — curl -f will fail silently; we just skip
     prot=$(gh_api "/repos/${owner_repo}/branches/${branch}/protection" 2>/dev/null) || continue
 
-    ((protected_count++))
+    protected_count=$((protected_count + 1))
 
     echo ""
     echo -e "   ${BOLD}${YELLOW}⚑  ${branch}${RESET}"
@@ -217,7 +211,7 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
     echo -e "   ${DIM}${protected_count} of ${branch_count} branch(es) protected${RESET}"
   fi
 
-  ((success++))
+  success=$((success + 1))
 
 done < "$REPOS_FILE"
 
