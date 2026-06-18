@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # =============================================================================
-# github_branch_audit.sh — GitHub Branch & Protection Rules Auditor
+# github_branch_audit.sh — GitHub Branch & Protection / Rulesets Auditor
 # =============================================================================
 # Requirements: curl, jq
 # Auth:         export GITHUB_TOKEN=ghp_yourtoken
 # Usage:        ./github_branch_audit.sh [repos.txt] [--debug]
 # Compatible:   Linux, macOS, Git Bash (Windows/MINGW64)
+#
+# Reads BOTH protection systems:
+#   - Classic branch protection : /repos/{o}/{r}/branches/{b}/protection
+#   - Repository rulesets        : /repos/{o}/{r}/rulesets  (modern; what absa uses)
 # =============================================================================
 
 set -uo pipefail
@@ -36,25 +40,24 @@ if [[ ! -f "$REPOS_FILE" ]]; then
   echo -e "${RED}Error:${RESET} Repos file not found: ${REPOS_FILE}"; exit 1
 fi
 
+# ── API helper ────────────────────────────────────────────────────────────────
+# Robust line-based split: append status on its OWN line, then read last line for
+# the code and strip that line for the body. No fragile parameter-expansion on
+# delimiters embedded in the JSON. Works on MINGW64 / dash / bash alike.
 LAST_HTTP_CODE=""
-LAST_BODY=""
 gh_api() {
   local endpoint="$1"
-  local sep=$'\n__HTTPCODE__:'
-  local raw http_code body msg
+  local raw http_code body
 
-  raw=$(curl -s -w "${sep}%{http_code}" \
+  raw=$(curl -s -w $'\nHTTPSTATUS:%{http_code}' \
     -H "Authorization: Bearer ${GITHUB_TOKEN}" \
     -H "Accept: application/vnd.github+json" \
     -H "X-GitHub-Api-Version: 2022-11-28" \
     "${API_BASE}${endpoint}" 2>/dev/null) || true
 
-  http_code="${raw##*__HTTPCODE__:}"
-  http_code="${http_code//[$'\r\n ']/}"
-  body="${raw%%$'\n'__HTTPCODE__:*}"
-
+  http_code=$(printf '%s' "$raw" | tail -n1 | sed 's/.*HTTPSTATUS://' | tr -d '\r\n ')
+  body=$(printf '%s' "$raw" | sed '$d')
   LAST_HTTP_CODE="$http_code"
-  LAST_BODY="$body"
 
   if [[ "$DEBUG" == "1" ]]; then
     echo -e "      ${DIM}[debug] ${endpoint} -> HTTP ${http_code:-none}, body ${#body} bytes${RESET}" >&2
@@ -66,7 +69,7 @@ gh_api() {
     return 1
   fi
   if [[ "$http_code" -ge 400 ]]; then
-    msg=$(printf '%s' "$body" | jq -r '.message // empty' 2>/dev/null || true)
+    local msg; msg=$(printf '%s' "$body" | jq -r '.message // empty' 2>/dev/null || true)
     echo "HTTP ${http_code}${msg:+ — ${msg}}" >&2
     return 1
   fi
@@ -80,19 +83,6 @@ jq_val() {
   local result; result=$(printf '%s' "$1" | jq -r "${2} // empty" 2>/dev/null) || true
   echo "${result:-—}"
 }
-
-echo ""
-if me=$(gh_api "/user" 2>/tmp/gh_err); then
-  login=$(jq_val "$me" '.login')
-  echo -e "${DIM}Authenticated as: ${login}${RESET}"
-  scopes=$(curl -sI -H "Authorization: Bearer ${GITHUB_TOKEN}" "${API_BASE}/user" 2>/dev/null \
-    | tr -d '\r' | grep -i '^x-oauth-scopes:' | cut -d' ' -f2- || true)
-  [[ -n "${scopes:-}" ]] && echo -e "${DIM}Token scopes: ${scopes}${RESET}"
-else
-  echo -e "${RED}✗ Token check failed — $(cat /tmp/gh_err)${RESET}"
-  echo -e "${RED}  Your GITHUB_TOKEN is invalid or expired. Fix this first.${RESET}"
-  exit 1
-fi
 
 repo_count=0
 while IFS= read -r line || [[ -n "${line:-}" ]]; do
@@ -120,125 +110,104 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
   echo -e "${BOLD}${CYAN}▶  ${owner} / ${repo}${RESET}"
   echo -e "   ${DIM}${url}${RESET}"
 
+  # ── Repo info ───────────────────────────────────────────────────────────────
   if ! repo_json=$(gh_api "/repos/${owner_repo}" 2>/tmp/gh_err); then
-    err="$(cat /tmp/gh_err)"
-    echo -e "   ${RED}✗  Could not fetch repo — ${err}${RESET}"
-    if [[ "$LAST_HTTP_CODE" == "403" ]]; then
-      echo -e "   ${YELLOW}  → If this is a SAML-protected org, authorize your token for SSO:${RESET}"
-      echo -e "   ${YELLOW}    GitHub → Settings → Developer settings → Tokens → Configure SSO → Authorize${RESET}"
-    fi
+    echo -e "   ${RED}✗  Could not fetch repo — $(cat /tmp/gh_err)${RESET}"
     failed=$((failed + 1)); continue
   fi
 
   default_branch=$(jq_val "$repo_json" '.default_branch')
   visibility=$(jq_val     "$repo_json" '.visibility')
+  echo -e "   ${GREEN}Default branch :${RESET}  ${BOLD}${default_branch}${RESET}  ${DIM}[${visibility}]${RESET}"
 
-  if [[ "$default_branch" == "—" ]]; then
-    echo -e "   ${RED}Default branch :${RESET}  ${RED}— (empty despite HTTP ${LAST_HTTP_CODE})${RESET}"
-    echo -e "   ${YELLOW}  → The API returned a repo object without 'default_branch'.${RESET}"
-    echo -e "   ${YELLOW}    Token likely lacks read access. Check: SSO authorization + 'repo'${RESET}"
-    echo -e "   ${YELLOW}    (classic) or 'Contents:Read'+'Administration:Read' (fine-grained).${RESET}"
-    if [[ "$DEBUG" == "1" ]]; then
-      echo -e "   ${DIM}[debug] repo JSON keys:${RESET}"
-      printf '%s' "$repo_json" | jq -r 'keys[]?' 2>/dev/null | sed 's/^/        /' | head -20
-    fi
-  else
-    echo -e "   ${GREEN}Default branch :${RESET}  ${BOLD}${default_branch}${RESET}  ${DIM}[${visibility}]${RESET}"
-  fi
-
+  # ── Branch list ─────────────────────────────────────────────────────────────
   if ! branches_json=$(gh_api "/repos/${owner_repo}/branches?per_page=100" 2>/tmp/gh_err); then
     echo -e "   ${YELLOW}⚠  Could not fetch branch list — $(cat /tmp/gh_err)${RESET}"
     failed=$((failed + 1)); continue
   fi
-
   branch_count=$(printf '%s' "$branches_json" | jq 'length' 2>/dev/null || echo "?")
   echo -e "   ${GREEN}Total branches :${RESET}  ${branch_count}"
-  echo -e "   ${GREEN}Protection rules:${RESET}"
 
+  # ── Repository rulesets (modern protection) ──────────────────────────────────
+  echo -e "   ${GREEN}Repository rulesets:${RESET}"
+  ruleset_count=0
+  if rulesets_json=$(gh_api "/repos/${owner_repo}/rulesets?includes_parents=true" 2>/tmp/gh_err); then
+    ruleset_count=$(printf '%s' "$rulesets_json" | jq 'length' 2>/dev/null || echo 0)
+    if [[ "${ruleset_count:-0}" -gt 0 ]]; then
+      while IFS= read -r rs_id; do
+        [[ -z "$rs_id" ]] && continue
+        rs_detail=$(gh_api "/repos/${owner_repo}/rulesets/${rs_id}" 2>/dev/null) || continue
+        rs_name=$(jq_val   "$rs_detail" '.name')
+        rs_enf=$(jq_val    "$rs_detail" '.enforcement')
+        rs_target=$(jq_val "$rs_detail" '.target')
+        rs_incl=$(printf '%s' "$rs_detail" | jq -r '[.conditions.ref_name.include[]?] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
+        rs_rules=$(printf '%s' "$rs_detail" | jq -r '[.rules[]?.type] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
+        echo ""
+        echo -e "   ${BOLD}${YELLOW}⚑  ${rs_name}${RESET}  ${DIM}[${rs_enf}, target: ${rs_target}]${RESET}"
+        echo -e "        Applies to refs          : ${rs_incl}"
+        echo -e "        Rules                    : ${rs_rules}"
+
+        # PR-review rule detail, if present
+        pr_rule=$(printf '%s' "$rs_detail" | jq -c '.rules[]? | select(.type=="pull_request")' 2>/dev/null || true)
+        if [[ -n "$pr_rule" ]]; then
+          approvals=$(printf '%s' "$pr_rule" | jq -r '.parameters.required_approving_review_count // "—"' 2>/dev/null)
+          dismiss=$(printf '%s'   "$pr_rule" | jq -r '.parameters.dismiss_stale_reviews_on_push // false' 2>/dev/null)
+          codeowners=$(printf '%s' "$pr_rule" | jq -r '.parameters.require_code_owner_review // false' 2>/dev/null)
+          lastpush=$(printf '%s'  "$pr_rule" | jq -r '.parameters.require_last_push_approval // false' 2>/dev/null)
+          echo -e "        ${DIM}PR reviews${RESET}"
+          echo -e "          Approvals required     : ${BOLD}${approvals}${RESET}"
+          echo -e "          Dismiss stale reviews  : $(bool_icon "$dismiss")"
+          echo -e "          Require code owners    : $(bool_icon "$codeowners")"
+          echo -e "          Require last-push appr : $(bool_icon "$lastpush")"
+        fi
+
+        # Required status checks rule detail, if present
+        sc_rule=$(printf '%s' "$rs_detail" | jq -c '.rules[]? | select(.type=="required_status_checks")' 2>/dev/null || true)
+        if [[ -n "$sc_rule" ]]; then
+          checks=$(printf '%s' "$sc_rule" | jq -r '[.parameters.required_status_checks[]?.context] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
+          strict=$(printf '%s' "$sc_rule" | jq -r '.parameters.strict_required_status_checks_policy // false' 2>/dev/null)
+          echo -e "        ${DIM}Status checks${RESET}"
+          echo -e "          Strict (up-to-date)    : $(bool_icon "$strict")"
+          echo -e "          Checks                 : ${checks}"
+        fi
+      done < <(printf '%s' "$rulesets_json" | jq -r '.[].id' 2>/dev/null)
+    else
+      echo -e "     ${DIM}No repository rulesets${RESET}"
+    fi
+  else
+    echo -e "     ${YELLOW}⚠  Could not fetch rulesets — $(cat /tmp/gh_err)${RESET}"
+  fi
+
+  # ── Classic branch protection ────────────────────────────────────────────────
+  echo -e "   ${GREEN}Classic branch protection:${RESET}"
   protected_count=0
-
   while IFS= read -r branch; do
     [[ -z "${branch}" ]] && continue
-
     if ! prot=$(gh_api "/repos/${owner_repo}/branches/${branch}/protection" 2>/tmp/gh_err); then
-      if [[ "$LAST_HTTP_CODE" == "404" ]]; then
-        continue
-      fi
+      [[ "$LAST_HTTP_CODE" == "404" ]] && continue
       echo -e "      ${RED}⚠  ${branch}: $(cat /tmp/gh_err)${RESET}"
       continue
     fi
-
     protected_count=$((protected_count + 1))
     echo ""
     echo -e "   ${BOLD}${YELLOW}⚑  ${branch}${RESET}"
 
-    if [[ "$(printf '%s' "$prot" | jq -r 'has("required_status_checks")')" == "true" ]]; then
-      strict=$(jq_val "$prot" '.required_status_checks.strict')
-      contexts=$(printf '%s' "$prot" | jq -r '[.required_status_checks.contexts[]?] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
-      checks=$(printf '%s' "$prot"   | jq -r '[.required_status_checks.checks[]?.context] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
-      echo -e "      ${DIM}Required status checks${RESET}"
-      echo -e "        Strict (up-to-date)      : $(bool_icon "$strict")"
-      echo -e "        Contexts                 : ${contexts}"
-      echo -e "        Checks                   : ${checks}"
-    else
-      echo -e "      ${DIM}Required status checks   : —${RESET}"
-    fi
-
     if [[ "$(printf '%s' "$prot" | jq -r 'has("required_pull_request_reviews")')" == "true" ]]; then
-      approvals=$(jq_val   "$prot" '.required_pull_request_reviews.required_approving_review_count')
-      dismiss=$(jq_val     "$prot" '.required_pull_request_reviews.dismiss_stale_reviews')
-      code_owners=$(jq_val "$prot" '.required_pull_request_reviews.require_code_owner_reviews')
-      last_push=$(jq_val   "$prot" '.required_pull_request_reviews.require_last_push_approval')
-      bypass_teams=$(printf '%s' "$prot" | jq -r '[.required_pull_request_reviews.bypass_pull_request_allowances.teams[]?.slug] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
-      echo -e "      ${DIM}Required PR reviews${RESET}"
+      approvals=$(jq_val "$prot" '.required_pull_request_reviews.required_approving_review_count')
       echo -e "        Approvals required       : ${BOLD}${approvals}${RESET}"
-      echo -e "        Dismiss stale reviews    : $(bool_icon "$dismiss")"
-      echo -e "        Require code owners      : $(bool_icon "$code_owners")"
-      echo -e "        Require last-push approv : $(bool_icon "$last_push")"
-      echo -e "        Bypass teams             : ${bypass_teams}"
-    else
-      echo -e "      ${DIM}Required PR reviews      : —${RESET}"
     fi
-
     enforce_admins=$(jq_val "$prot" '.enforce_admins.enabled')
     force_pushes=$(jq_val   "$prot" '.allow_force_pushes.enabled')
     allow_delete=$(jq_val   "$prot" '.allow_deletions.enabled')
-    linear=$(jq_val         "$prot" '.required_linear_history.enabled')
-    conv_res=$(jq_val       "$prot" '.required_conversation_resolution.enabled')
-    signed=$(jq_val         "$prot" '.required_signatures.enabled')
-    if [[ "$signed" == "—" ]]; then
-      sig_json=$(gh_api "/repos/${owner_repo}/branches/${branch}/protection/required_signatures" 2>/dev/null) || sig_json=""
-      signed=$(jq_val "$sig_json" '.enabled')
-    fi
-
-    echo -e "      ${DIM}Other settings${RESET}"
     echo -e "        Enforce for admins       : $(bool_icon "$enforce_admins")"
     echo -e "        Allow force pushes       : $(bool_icon "$force_pushes")"
     echo -e "        Allow deletions          : $(bool_icon "$allow_delete")"
-    echo -e "        Require linear history   : $(bool_icon "$linear")"
-    echo -e "        Require signed commits   : $(bool_icon "$signed")"
-    echo -e "        Resolve conversations    : $(bool_icon "$conv_res")"
-
-    if [[ "$(printf '%s' "$prot" | jq -r 'has("restrictions")')" == "true" ]]; then
-      r_users=$(printf '%s' "$prot" | jq -r '[.restrictions.users[]?.login] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
-      r_teams=$(printf '%s' "$prot" | jq -r '[.restrictions.teams[]?.slug]  | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
-      r_apps=$(printf '%s'  "$prot" | jq -r '[.restrictions.apps[]?.slug]   | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
-      echo -e "      ${DIM}Push restrictions${RESET}"
-      echo -e "        Users                    : ${r_users}"
-      echo -e "        Teams                    : ${r_teams}"
-      echo -e "        Apps                     : ${r_apps}"
-    else
-      echo -e "      ${DIM}Push restrictions        : — (unrestricted)${RESET}"
-    fi
-
   done < <(printf '%s' "$branches_json" | jq -r '.[].name' 2>/dev/null)
+  [[ $protected_count -eq 0 ]] && echo -e "     ${DIM}No branches use classic protection${RESET}"
 
-  if [[ $protected_count -eq 0 ]]; then
-    echo -e "     ${DIM}No branches have protection rules${RESET}"
-  else
-    echo ""
-    echo -e "   ${DIM}${protected_count} of ${branch_count} branch(es) protected${RESET}"
-  fi
+  # ── Per-repo summary ─────────────────────────────────────────────────────────
+  echo ""
+  echo -e "   ${DIM}${ruleset_count:-0} ruleset(s), ${protected_count} classic-protected branch(es) of ${branch_count}${RESET}"
 
   success=$((success + 1))
 done < "$REPOS_FILE"
