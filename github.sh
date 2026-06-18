@@ -10,44 +10,31 @@
 
 set -uo pipefail
 
-# ── Config ────────────────────────────────────────────────────────────────────
 REPOS_FILE="${1:-repos.txt}"
 API_BASE="https://api.github.com"
 
-# ── Colours ───────────────────────────────────────────────────────────────────
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-DIM='\033[2m'
-RESET='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
 
-# ── Preflight checks ──────────────────────────────────────────────────────────
 if [[ -z "${GITHUB_TOKEN:-}" ]]; then
   echo -e "${RED}Error:${RESET} GITHUB_TOKEN is not set."
-  echo "  Run: export GITHUB_TOKEN=ghp_yourtoken"
-  exit 1
+  echo "  Run: export GITHUB_TOKEN=ghp_yourtoken"; exit 1
 fi
-
 if ! command -v jq &>/dev/null; then
   echo -e "${RED}Error:${RESET} jq is required but not installed."
-  echo "  Install: sudo apt install jq  OR  brew install jq  OR  winget install jqlang.jq"
-  exit 1
+  echo "  Install: sudo apt install jq  OR  brew install jq  OR  winget install jqlang.jq"; exit 1
 fi
-
 if [[ ! -f "$REPOS_FILE" ]]; then
-  echo -e "${RED}Error:${RESET} Repos file not found: ${REPOS_FILE}"
-  exit 1
+  echo -e "${RED}Error:${RESET} Repos file not found: ${REPOS_FILE}"; exit 1
 fi
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-# No temp files — appends a unique delimiter + HTTP code to the response body.
-# Works with both Git Bash (Windows curl.exe) and Linux/macOS curl.
+# ── API helper ────────────────────────────────────────────────────────────────
+# Returns body on stdout, status code on fd 3 (so callers can branch on 404).
+# On HTTP >=400 it returns 1 but still emits the code via LAST_HTTP_CODE.
+LAST_HTTP_CODE=""
 gh_api() {
   local endpoint="$1"
-  local sep="XHTTPCODE:"   # must NOT start with @ — Windows curl treats -w "@..." as read-from-file
+  local sep="XHTTPCODE:"
   local raw http_code body msg
 
   raw=$(curl -s -w "${sep}%{http_code}" \
@@ -56,49 +43,31 @@ gh_api() {
     -H "X-GitHub-Api-Version: 2022-11-28" \
     "${API_BASE}${endpoint}" 2>/dev/null) || true
 
-  # Split on the delimiter — everything after last occurrence is the status code
   http_code="${raw##*${sep}}"
   body="${raw%${sep}*}"
+  LAST_HTTP_CODE="$http_code"
 
-  if [[ -z "$http_code" ]]; then
+  if [[ -z "$http_code" || ! "$http_code" =~ ^[0-9]+$ ]]; then
+    LAST_HTTP_CODE="000"
     echo "curl failed — check network connection" >&2
     return 1
   fi
-
   if [[ "$http_code" -ge 400 ]]; then
     msg=$(printf '%s' "$body" | jq -r '.message // empty' 2>/dev/null || true)
     echo "HTTP ${http_code}${msg:+ — ${msg}}" >&2
     return 1
   fi
-
   printf '%s' "$body"
 }
 
-extract_owner_repo() {
-  local url="${1%.git}"
-  echo "${url#*github.com/}"
-}
-
-separator() {
-  echo -e "${DIM}────────────────────────────────────────────────────────────────────────${RESET}"
-}
-
-bool_icon() {
-  if [[ "${1:-false}" == "true" ]]; then
-    echo -e "${GREEN}yes${RESET}"
-  else
-    echo -e "${DIM}no${RESET}"
-  fi
-}
-
+extract_owner_repo() { local url="${1%.git}"; echo "${url#*github.com/}"; }
+separator() { echo -e "${DIM}────────────────────────────────────────────────────────────────────────${RESET}"; }
+bool_icon() { [[ "${1:-false}" == "true" ]] && echo -e "${GREEN}yes${RESET}" || echo -e "${DIM}no${RESET}"; }
 jq_val() {
-  local json="$1" filter="$2"
-  local result
-  result=$(printf '%s' "$json" | jq -r "${filter} // empty" 2>/dev/null) || true
+  local result; result=$(printf '%s' "$1" | jq -r "${2} // empty" 2>/dev/null) || true
   echo "${result:-—}"
 }
 
-# ── Count repos ───────────────────────────────────────────────────────────────
 repo_count=0
 while IFS= read -r line || [[ -n "${line:-}" ]]; do
   line="${line//$'\r'/}"
@@ -106,60 +75,43 @@ while IFS= read -r line || [[ -n "${line:-}" ]]; do
   repo_count=$((repo_count + 1))
 done < "$REPOS_FILE"
 
-# ── Header ────────────────────────────────────────────────────────────────────
 separator
 echo -e "  ${BOLD}GitHub Branch & Protection Rules Audit${RESET}"
 echo -e "  ${DIM}$(date '+%Y-%m-%d %H:%M:%S')   File: ${REPOS_FILE}   Repos: ${repo_count}${RESET}"
 separator
 
-total=0
-success=0
-failed=0
+total=0; success=0; failed=0
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
 while IFS= read -r url || [[ -n "${url:-}" ]]; do
-
   url="${url//$'\r'/}"
   [[ -z "${url// }" || "$url" == \#* ]] && continue
-
   total=$((total + 1))
 
   owner_repo=$(extract_owner_repo "$url")
-  owner="${owner_repo%%/*}"
-  repo="${owner_repo##*/}"
+  owner="${owner_repo%%/*}"; repo="${owner_repo##*/}"
 
   echo ""
   echo -e "${BOLD}${CYAN}▶  ${owner} / ${repo}${RESET}"
   echo -e "   ${DIM}${url}${RESET}"
 
-  # ── Repo info ────────────────────────────────────────────────────────────────
-  repo_json=""
-  api_err=""
+  # ── Repo info ───────────────────────────────────────────────────────────────
   if ! repo_json=$(gh_api "/repos/${owner_repo}" 2>/tmp/gh_err); then
-    api_err=$(cat /tmp/gh_err 2>/dev/null || true)
-    echo -e "   ${RED}✗  Could not fetch repo — ${api_err}${RESET}"
-    failed=$((failed + 1))
-    continue
+    echo -e "   ${RED}✗  Could not fetch repo — $(cat /tmp/gh_err)${RESET}"
+    failed=$((failed + 1)); continue
   fi
 
   default_branch=$(jq_val "$repo_json" '.default_branch')
   visibility=$(jq_val     "$repo_json" '.visibility')
-
   echo -e "   ${GREEN}Default branch :${RESET}  ${BOLD}${default_branch}${RESET}  ${DIM}[${visibility}]${RESET}"
 
-  # ── Branch list ──────────────────────────────────────────────────────────────
-  branches_json=""
+  # ── Branch list ─────────────────────────────────────────────────────────────
   if ! branches_json=$(gh_api "/repos/${owner_repo}/branches?per_page=100" 2>/tmp/gh_err); then
-    api_err=$(cat /tmp/gh_err 2>/dev/null || true)
-    echo -e "   ${YELLOW}⚠  Could not fetch branch list — ${api_err}${RESET}"
-    failed=$((failed + 1))
-    continue
+    echo -e "   ${YELLOW}⚠  Could not fetch branch list — $(cat /tmp/gh_err)${RESET}"
+    failed=$((failed + 1)); continue
   fi
 
   branch_count=$(printf '%s' "$branches_json" | jq 'length' 2>/dev/null || echo "?")
   echo -e "   ${GREEN}Total branches :${RESET}  ${branch_count}"
-
-  # ── Protection rules ─────────────────────────────────────────────────────────
   echo -e "   ${GREEN}Protection rules:${RESET}"
 
   protected_count=0
@@ -167,17 +119,21 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
   while IFS= read -r branch; do
     [[ -z "${branch}" ]] && continue
 
-    prot=""
-    prot=$(gh_api "/repos/${owner_repo}/branches/${branch}/protection" 2>/dev/null) || continue
+    # Distinguish 404 (unprotected) from real errors (403 token scope, etc.)
+    if ! prot=$(gh_api "/repos/${owner_repo}/branches/${branch}/protection" 2>/tmp/gh_err); then
+      if [[ "$LAST_HTTP_CODE" == "404" ]]; then
+        continue  # genuinely unprotected — skip quietly
+      fi
+      echo -e "      ${RED}⚠  ${branch}: $(cat /tmp/gh_err)${RESET}"
+      continue
+    fi
 
     protected_count=$((protected_count + 1))
-
     echo ""
     echo -e "   ${BOLD}${YELLOW}⚑  ${branch}${RESET}"
 
     # Required status checks
-    has_checks=$(printf '%s' "$prot" | jq -r 'if .required_status_checks then "true" else "false" end' 2>/dev/null || echo "false")
-    if [[ "$has_checks" == "true" ]]; then
+    if [[ "$(printf '%s' "$prot" | jq -r 'has("required_status_checks")')" == "true" ]]; then
       strict=$(jq_val "$prot" '.required_status_checks.strict')
       contexts=$(printf '%s' "$prot" | jq -r '[.required_status_checks.contexts[]?] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
       checks=$(printf '%s' "$prot"   | jq -r '[.required_status_checks.checks[]?.context] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
@@ -190,8 +146,7 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
     fi
 
     # Required PR reviews
-    has_pr=$(printf '%s' "$prot" | jq -r 'if .required_pull_request_reviews then "true" else "false" end' 2>/dev/null || echo "false")
-    if [[ "$has_pr" == "true" ]]; then
+    if [[ "$(printf '%s' "$prot" | jq -r 'has("required_pull_request_reviews")')" == "true" ]]; then
       approvals=$(jq_val   "$prot" '.required_pull_request_reviews.required_approving_review_count')
       dismiss=$(jq_val     "$prot" '.required_pull_request_reviews.dismiss_stale_reviews')
       code_owners=$(jq_val "$prot" '.required_pull_request_reviews.require_code_owner_reviews')
@@ -207,13 +162,18 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
       echo -e "      ${DIM}Required PR reviews      : —${RESET}"
     fi
 
-    # General flags
     enforce_admins=$(jq_val "$prot" '.enforce_admins.enabled')
     force_pushes=$(jq_val   "$prot" '.allow_force_pushes.enabled')
     allow_delete=$(jq_val   "$prot" '.allow_deletions.enabled')
     linear=$(jq_val         "$prot" '.required_linear_history.enabled')
     conv_res=$(jq_val       "$prot" '.required_conversation_resolution.enabled')
     signed=$(jq_val         "$prot" '.required_signatures.enabled')
+
+    # required_signatures is often absent from the protection payload — fetch it
+    if [[ "$signed" == "—" ]]; then
+      sig_json=$(gh_api "/repos/${owner_repo}/branches/${branch}/protection/required_signatures" 2>/dev/null) || sig_json=""
+      signed=$(jq_val "$sig_json" '.enabled')
+    fi
 
     echo -e "      ${DIM}Other settings${RESET}"
     echo -e "        Enforce for admins       : $(bool_icon "$enforce_admins")"
@@ -223,9 +183,7 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
     echo -e "        Require signed commits   : $(bool_icon "$signed")"
     echo -e "        Resolve conversations    : $(bool_icon "$conv_res")"
 
-    # Push restrictions
-    has_restrictions=$(printf '%s' "$prot" | jq -r 'if .restrictions then "true" else "false" end' 2>/dev/null || echo "false")
-    if [[ "$has_restrictions" == "true" ]]; then
+    if [[ "$(printf '%s' "$prot" | jq -r 'has("restrictions")')" == "true" ]]; then
       r_users=$(printf '%s' "$prot" | jq -r '[.restrictions.users[]?.login] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
       r_teams=$(printf '%s' "$prot" | jq -r '[.restrictions.teams[]?.slug]  | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
       r_apps=$(printf '%s'  "$prot" | jq -r '[.restrictions.apps[]?.slug]   | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
@@ -242,15 +200,13 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
   if [[ $protected_count -eq 0 ]]; then
     echo -e "     ${DIM}No branches have protection rules${RESET}"
   else
-    echo -e ""
+    echo ""
     echo -e "   ${DIM}${protected_count} of ${branch_count} branch(es) protected${RESET}"
   fi
 
   success=$((success + 1))
-
 done < "$REPOS_FILE"
 
-# ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 separator
 echo -e "  ${BOLD}Audit complete${RESET}"
