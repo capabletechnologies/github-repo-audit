@@ -2,15 +2,15 @@
 # =============================================================================
 # github_branch_audit.sh — GitHub Branch & Protection Rules Auditor
 # =============================================================================
-# Reads a list of GitHub repo URLs from repos.txt (or a custom file), then
-# prints the default branch and all branch protection rules for each repo.
-#
 # Requirements: curl, jq
 # Auth:         export GITHUB_TOKEN=ghp_yourtoken
 # Usage:        ./github_branch_audit.sh [repos.txt]
+# Compatible:   Linux, macOS, Git Bash (Windows/MINGW64)
 # =============================================================================
 
-set -euo pipefail
+# No set -e: we handle errors explicitly so Git Bash / MINGW doesn't bail out
+# silently on non-zero sub-expressions or jq edge cases.
+set -uo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
 REPOS_FILE="${1:-repos.txt}"
@@ -34,23 +34,19 @@ fi
 
 if ! command -v jq &>/dev/null; then
   echo -e "${RED}Error:${RESET} jq is required but not installed."
-  echo "  Install: sudo apt install jq   OR   brew install jq"
+  echo "  Install: sudo apt install jq  OR  brew install jq  OR  winget install jqlang.jq"
   exit 1
 fi
 
 if [[ ! -f "$REPOS_FILE" ]]; then
   echo -e "${RED}Error:${RESET} Repos file not found: ${REPOS_FILE}"
-  echo "  Create repos.txt with one GitHub URL per line, e.g.:"
-  echo "    https://github.com/myorg/repo-one"
-  echo "    https://github.com/myorg/repo-two"
   exit 1
 fi
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-# Authenticated GitHub API call — returns raw JSON on stdout
-# Usage: gh_api "/repos/owner/repo"
 gh_api() {
+  # Returns JSON on stdout; returns non-zero on HTTP 4xx/5xx (curl -f)
   local endpoint="$1"
   curl -sf \
     -H "Authorization: Bearer ${GITHUB_TOKEN}" \
@@ -59,24 +55,38 @@ gh_api() {
     "${API_BASE}${endpoint}"
 }
 
-# Extract "owner/repo" from a full GitHub URL
-# Handles trailing .git and any path depth
 extract_owner_repo() {
-  local url="${1%.git}"        # strip optional .git suffix
-  echo "${url#*github.com/}"  # strip everything up to and including github.com/
+  local url="${1%.git}"
+  echo "${url#*github.com/}"
 }
 
 separator() {
-  echo -e "${DIM}$(printf '─%.0s' {1..72})${RESET}"
+  echo -e "${DIM}────────────────────────────────────────────────────────────────────────${RESET}"
 }
 
 bool_icon() {
-  # Prints ✓ (green) for true, ✗ (dim) for false
-  [[ "$1" == "true" ]] && echo -e "${GREEN}✓${RESET}" || echo -e "${DIM}✗${RESET}"
+  if [[ "${1:-false}" == "true" ]]; then
+    echo -e "${GREEN}yes${RESET}"
+  else
+    echo -e "${DIM}no${RESET}"
+  fi
 }
 
-# ── Count valid lines for the header ─────────────────────────────────────────
-repo_count=$(grep -cE '^[^#[:space:]]' "$REPOS_FILE" || true)
+jq_val() {
+  # Safe jq wrapper — returns "—" if field is null/missing/empty
+  local json="$1" filter="$2"
+  local result
+  result=$(echo "$json" | jq -r "${filter} // empty" 2>/dev/null) || true
+  echo "${result:-—}"
+}
+
+# ── Count repos (strip comments/blanks) ───────────────────────────────────────
+repo_count=0
+while IFS= read -r line || [[ -n "${line:-}" ]]; do
+  line="${line//$'\r'/}"                      # strip Windows CR
+  [[ -z "${line// }" || "$line" == \#* ]] && continue
+  repo_count=$((repo_count + 1))
+done < "$REPOS_FILE"
 
 # ── Header ────────────────────────────────────────────────────────────────────
 separator
@@ -84,13 +94,17 @@ echo -e "  ${BOLD}GitHub Branch & Protection Rules Audit${RESET}"
 echo -e "  ${DIM}$(date '+%Y-%m-%d %H:%M:%S')   File: ${REPOS_FILE}   Repos: ${repo_count}${RESET}"
 separator
 
-total=0; success=0; failed=0
+total=0
+success=0
+failed=0
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 while IFS= read -r url || [[ -n "${url:-}" ]]; do
 
-  # Skip blank lines and comment lines
+  # Strip Windows carriage return and skip blanks / comments
+  url="${url//$'\r'/}"
   [[ -z "${url// }" || "$url" == \#* ]] && continue
+
   total=$((total + 1))
 
   owner_repo=$(extract_owner_repo "$url")
@@ -101,84 +115,85 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
   echo -e "${BOLD}${CYAN}▶  ${owner} / ${repo}${RESET}"
   echo -e "   ${DIM}${url}${RESET}"
 
-  # ── Repo info (default branch, visibility) ──────────────────────────────────
+  # ── Repo info ────────────────────────────────────────────────────────────────
+  repo_json=""
   if ! repo_json=$(gh_api "/repos/${owner_repo}" 2>/dev/null); then
-    echo -e "   ${RED}✗  Failed to fetch repo — check token scope or repo name${RESET}"
-    failed=$((failed + 1)); continue=$(echo "$repo_json" | jq -r '.default_branch')
-  visibility=$(echo "$repo_json"     | jq -r '.visibility')
+    echo -e "   ${RED}✗  Could not fetch repo — verify token scope (repo) and repo name${RESET}"
+    failed=$((failed + 1))
+    continue
+  fi
 
-  echo -e "   ${GREEN}Default branch:${RESET}  ${BOLD}${default_branch}${RESET}  ${DIM}[${visibility}]${RESET}"
+  default_branch=$(jq_val "$repo_json" '.default_branch')
+  visibility=$(jq_val     "$repo_json" '.visibility')
 
-  # ── Branch list ─────────────────────────────────────────────────────────────
+  echo -e "   ${GREEN}Default branch :${RESET}  ${BOLD}${default_branch}${RESET}  ${DIM}[${visibility}]${RESET}"
+
+  # ── Branch list ──────────────────────────────────────────────────────────────
+  branches_json=""
   if ! branches_json=$(gh_api "/repos/${owner_repo}/branches?per_page=100" 2>/dev/null); then
     echo -e "   ${YELLOW}⚠  Could not fetch branch list${RESET}"
-    failed=$((failed + 1)); continue=$(echo "$branches_json" | jq 'length')
-  branch_names=$(echo "$branches_json" | jq -r '.[].name')
-  echo -e "   ${GREEN}Total branches:${RESET}   ${branch_count}"
+    failed=$((failed + 1))
+    continue
+  fi
 
-  # ── Protection rules ────────────────────────────────────────────────────────
+  branch_count=$(echo "$branches_json" | jq 'length' 2>/dev/null || echo "?")
+  echo -e "   ${GREEN}Total branches :${RESET}  ${branch_count}"
+
+  # ── Protection rules ─────────────────────────────────────────────────────────
   echo -e "   ${GREEN}Protection rules:${RESET}"
 
   protected_count=0
 
   while IFS= read -r branch; do
-    [[ -z "$branch" ]] && continue
+    [[ -z "${branch}" ]] && continue
 
-    # A 404 means no protection — curl -f will fail silently; we just skip
+    prot=""
     prot=$(gh_api "/repos/${owner_repo}/branches/${branch}/protection" 2>/dev/null) || continue
-
+    # If we reach here the branch has a protection rule
     protected_count=$((protected_count + 1))
 
     echo ""
     echo -e "   ${BOLD}${YELLOW}⚑  ${branch}${RESET}"
 
-    # ── Required status checks ────────────────────────────────────────────────
-    has_status=$(echo "$prot" | jq -r 'if .required_status_checks then "true" else "false" end')
-    if [[ "$has_status" == "true" ]]; then
-      strict=$(echo "$prot"   | jq -r '.required_status_checks.strict')
-      contexts=$(echo "$prot" | jq -r '.required_status_checks.contexts | join(", ")' 2>/dev/null || echo "—")
-      checks=$(echo "$prot"   | jq -r '
-        if (.required_status_checks.checks | length) > 0
-        then [ .required_status_checks.checks[] | .context ] | join(", ")
-        else "—" end
-      ' 2>/dev/null || echo "—")
+    # Required status checks
+    has_checks=$(echo "$prot" | jq -r 'if .required_status_checks then "true" else "false" end' 2>/dev/null || echo "false")
+    if [[ "$has_checks" == "true" ]]; then
+      strict=$(jq_val    "$prot" '.required_status_checks.strict')
+      contexts=$(echo "$prot" | jq -r '[.required_status_checks.contexts[]? ] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
+      checks=$(echo   "$prot" | jq -r '[.required_status_checks.checks[]?.context] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
       echo -e "      ${DIM}Required status checks${RESET}"
-      echo -e "        Strict up-to-date branch : $(bool_icon "$strict")"
-      echo -e "        Contexts                 : ${contexts:-—}"
-      echo -e "        Checks                   : ${checks:-—}"
+      echo -e "        Strict (up-to-date)      : $(bool_icon "$strict")"
+      echo -e "        Contexts                 : ${contexts}"
+      echo -e "        Checks                   : ${checks}"
     else
       echo -e "      ${DIM}Required status checks   : —${RESET}"
     fi
 
-    # ── Required pull-request reviews ─────────────────────────────────────────
-    has_pr=$(echo "$prot" | jq -r 'if .required_pull_request_reviews then "true" else "false" end')
+    # Required PR reviews
+    has_pr=$(echo "$prot" | jq -r 'if .required_pull_request_reviews then "true" else "false" end' 2>/dev/null || echo "false")
     if [[ "$has_pr" == "true" ]]; then
-      approvals=$(echo "$prot"     | jq -r '.required_pull_request_reviews.required_approving_review_count // 0')
-      dismiss=$(echo "$prot"       | jq -r '.required_pull_request_reviews.dismiss_stale_reviews // false')
-      code_owners=$(echo "$prot"   | jq -r '.required_pull_request_reviews.require_code_owner_reviews // false')
-      last_push=$(echo "$prot"     | jq -r '.required_pull_request_reviews.require_last_push_approval // false')
-      bypass_teams=$(echo "$prot"  | jq -r '
-        if (.required_pull_request_reviews.bypass_pull_request_allowances.teams | length) > 0
-        then [ .required_pull_request_reviews.bypass_pull_request_allowances.teams[].slug ] | join(", ")
-        else "—" end
-      ' 2>/dev/null || echo "—")
+      approvals=$(jq_val    "$prot" '.required_pull_request_reviews.required_approving_review_count')
+      dismiss=$(jq_val      "$prot" '.required_pull_request_reviews.dismiss_stale_reviews')
+      code_owners=$(jq_val  "$prot" '.required_pull_request_reviews.require_code_owner_reviews')
+      last_push=$(jq_val    "$prot" '.required_pull_request_reviews.require_last_push_approval')
+      bypass_teams=$(echo "$prot" | jq -r '[.required_pull_request_reviews.bypass_pull_request_allowances.teams[]?.slug] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
       echo -e "      ${DIM}Required PR reviews${RESET}"
       echo -e "        Approvals required       : ${BOLD}${approvals}${RESET}"
       echo -e "        Dismiss stale reviews    : $(bool_icon "$dismiss")"
       echo -e "        Require code owners      : $(bool_icon "$code_owners")"
-      echo -e "        Require last-push approx : $(bool_icon "$last_push")"
+      echo -e "        Require last-push approv : $(bool_icon "$last_push")"
       echo -e "        Bypass teams             : ${bypass_teams}"
     else
       echo -e "      ${DIM}Required PR reviews      : —${RESET}"
     fi
 
-    # ── Misc flags ────────────────────────────────────────────────────────────
-    enforce_admins=$(echo "$prot"  | jq -r '.enforce_admins.enabled // false')
-    force_pushes=$(echo "$prot"    | jq -r '.allow_force_pushes.enabled // false')
-    allow_delete=$(echo "$prot"    | jq -r '.allow_deletions.enabled // false')
-    linear=$(echo "$prot"          | jq -r '.required_linear_history.enabled // false')
-    conv_res=$(echo "$prot"        | jq -r '.required_conversation_resolution.enabled // false')
-    signed=$(echo "$prot"          | jq -r '.required_signatures.enabled // false')
+    # General flags
+    enforce_admins=$(jq_val "$prot" '.enforce_admins.enabled')
+    force_pushes=$(jq_val   "$prot" '.allow_force_pushes.enabled')
+    allow_delete=$(jq_val   "$prot" '.allow_deletions.enabled')
+    linear=$(jq_val         "$prot" '.required_linear_history.enabled')
+    conv_res=$(jq_val       "$prot" '.required_conversation_resolution.enabled')
+    signed=$(jq_val         "$prot" '.required_signatures.enabled')
 
     echo -e "      ${DIM}Other settings${RESET}"
     echo -e "        Enforce for admins       : $(bool_icon "$enforce_admins")"
@@ -186,23 +201,23 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
     echo -e "        Allow deletions          : $(bool_icon "$allow_delete")"
     echo -e "        Require linear history   : $(bool_icon "$linear")"
     echo -e "        Require signed commits   : $(bool_icon "$signed")"
-    echo -e "        Resolve all conversations: $(bool_icon "$conv_res")"
+    echo -e "        Resolve conversations    : $(bool_icon "$conv_res")"
 
-    # ── Push restrictions ─────────────────────────────────────────────────────
-    has_restrictions=$(echo "$prot" | jq -r 'if .restrictions then "true" else "false" end')
+    # Push restrictions
+    has_restrictions=$(echo "$prot" | jq -r 'if .restrictions then "true" else "false" end' 2>/dev/null || echo "false")
     if [[ "$has_restrictions" == "true" ]]; then
-      r_users=$(echo "$prot"  | jq -r '[ .restrictions.users[].login ] | join(", ")' 2>/dev/null || echo "—")
-      r_teams=$(echo "$prot"  | jq -r '[ .restrictions.teams[].slug  ] | join(", ")' 2>/dev/null || echo "—")
-      r_apps=$(echo "$prot"   | jq -r '[ .restrictions.apps[].slug   ] | join(", ")' 2>/dev/null || echo "—")
+      r_users=$(echo "$prot" | jq -r '[.restrictions.users[]?.login] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
+      r_teams=$(echo "$prot" | jq -r '[.restrictions.teams[]?.slug]  | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
+      r_apps=$(echo  "$prot" | jq -r '[.restrictions.apps[]?.slug]   | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
       echo -e "      ${DIM}Push restrictions${RESET}"
-      echo -e "        Users                    : ${r_users:-—}"
-      echo -e "        Teams                    : ${r_teams:-—}"
-      echo -e "        Apps                     : ${r_apps:-—}"
+      echo -e "        Users                    : ${r_users}"
+      echo -e "        Teams                    : ${r_teams}"
+      echo -e "        Apps                     : ${r_apps}"
     else
       echo -e "      ${DIM}Push restrictions        : — (unrestricted)${RESET}"
     fi
 
-  done <<< "$branch_names"
+  done < <(echo "$branches_json" | jq -r '.[].name' 2>/dev/null)
 
   if [[ $protected_count -eq 0 ]]; then
     echo -e "     ${DIM}No branches have protection rules${RESET}"
