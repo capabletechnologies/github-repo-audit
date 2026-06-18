@@ -8,8 +8,6 @@
 # Compatible:   Linux, macOS, Git Bash (Windows/MINGW64)
 # =============================================================================
 
-# No set -e: we handle errors explicitly so Git Bash / MINGW doesn't bail out
-# silently on non-zero sub-expressions or jq edge cases.
 set -uo pipefail
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -46,13 +44,27 @@ fi
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 gh_api() {
-  # Returns JSON on stdout; returns non-zero on HTTP 4xx/5xx (curl -f)
+  # On success:    prints JSON to stdout, returns 0
+  # On HTTP error: prints GitHub's own error message to stderr, returns 1
   local endpoint="$1"
-  curl -sf \
+  local tmpfile
+  tmpfile=$(mktemp)
+  local http_code
+  http_code=$(curl -s -o "$tmpfile" -w "%{http_code}" \
     -H "Authorization: Bearer ${GITHUB_TOKEN}" \
     -H "Accept: application/vnd.github+json" \
     -H "X-GitHub-Api-Version: 2022-11-28" \
-    "${API_BASE}${endpoint}"
+    "${API_BASE}${endpoint}")
+  local body
+  body=$(cat "$tmpfile")
+  rm -f "$tmpfile"
+  if [[ "$http_code" -ge 400 ]]; then
+    local msg
+    msg=$(echo "$body" | jq -r '.message // empty' 2>/dev/null || true)
+    echo "HTTP ${http_code}${msg:+ — ${msg}}" >&2
+    return 1
+  fi
+  echo "$body"
 }
 
 extract_owner_repo() {
@@ -73,17 +85,16 @@ bool_icon() {
 }
 
 jq_val() {
-  # Safe jq wrapper — returns "—" if field is null/missing/empty
   local json="$1" filter="$2"
   local result
   result=$(echo "$json" | jq -r "${filter} // empty" 2>/dev/null) || true
   echo "${result:-—}"
 }
 
-# ── Count repos (strip comments/blanks) ───────────────────────────────────────
+# ── Count repos ───────────────────────────────────────────────────────────────
 repo_count=0
 while IFS= read -r line || [[ -n "${line:-}" ]]; do
-  line="${line//$'\r'/}"                      # strip Windows CR
+  line="${line//$'\r'/}"
   [[ -z "${line// }" || "$line" == \#* ]] && continue
   repo_count=$((repo_count + 1))
 done < "$REPOS_FILE"
@@ -101,7 +112,6 @@ failed=0
 # ── Main loop ─────────────────────────────────────────────────────────────────
 while IFS= read -r url || [[ -n "${url:-}" ]]; do
 
-  # Strip Windows carriage return and skip blanks / comments
   url="${url//$'\r'/}"
   [[ -z "${url// }" || "$url" == \#* ]] && continue
 
@@ -117,8 +127,17 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
 
   # ── Repo info ────────────────────────────────────────────────────────────────
   repo_json=""
-  if ! repo_json=$(gh_api "/repos/${owner_repo}" 2>/dev/null); then
-    echo -e "   ${RED}✗  Could not fetch repo — verify token scope (repo) and repo name${RESET}"
+  api_err=""
+  if ! repo_json=$(gh_api "/repos/${owner_repo}" 2>/tmp/gh_err); then
+    api_err=$(cat /tmp/gh_err 2>/dev/null || true)
+    echo -e "   ${RED}✗  Could not fetch repo${RESET}"
+    echo -e "   ${RED}   ${api_err}${RESET}"
+    # Hint for the most common enterprise issue
+    if echo "$api_err" | grep -qi "403\|resource protected by organization SAML\|must grant your OAuth token"; then
+      echo -e "   ${YELLOW}   ➜  Your token needs SSO authorisation for this org.${RESET}"
+      echo -e "   ${YELLOW}      github.com → Settings → Developer settings → Personal access tokens${RESET}"
+      echo -e "   ${YELLOW}      → find your token → click \"Configure SSO\" → Authorize for this org${RESET}"
+    fi
     failed=$((failed + 1))
     continue
   fi
@@ -130,8 +149,9 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
 
   # ── Branch list ──────────────────────────────────────────────────────────────
   branches_json=""
-  if ! branches_json=$(gh_api "/repos/${owner_repo}/branches?per_page=100" 2>/dev/null); then
-    echo -e "   ${YELLOW}⚠  Could not fetch branch list${RESET}"
+  if ! branches_json=$(gh_api "/repos/${owner_repo}/branches?per_page=100" 2>/tmp/gh_err); then
+    api_err=$(cat /tmp/gh_err 2>/dev/null || true)
+    echo -e "   ${YELLOW}⚠  Could not fetch branch list — ${api_err}${RESET}"
     failed=$((failed + 1))
     continue
   fi
@@ -149,7 +169,7 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
 
     prot=""
     prot=$(gh_api "/repos/${owner_repo}/branches/${branch}/protection" 2>/dev/null) || continue
-    # If we reach here the branch has a protection rule
+
     protected_count=$((protected_count + 1))
 
     echo ""
@@ -158,8 +178,8 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
     # Required status checks
     has_checks=$(echo "$prot" | jq -r 'if .required_status_checks then "true" else "false" end' 2>/dev/null || echo "false")
     if [[ "$has_checks" == "true" ]]; then
-      strict=$(jq_val    "$prot" '.required_status_checks.strict')
-      contexts=$(echo "$prot" | jq -r '[.required_status_checks.contexts[]? ] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
+      strict=$(jq_val "$prot" '.required_status_checks.strict')
+      contexts=$(echo "$prot" | jq -r '[.required_status_checks.contexts[]?] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
       checks=$(echo   "$prot" | jq -r '[.required_status_checks.checks[]?.context] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
       echo -e "      ${DIM}Required status checks${RESET}"
       echo -e "        Strict (up-to-date)      : $(bool_icon "$strict")"
@@ -172,11 +192,11 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
     # Required PR reviews
     has_pr=$(echo "$prot" | jq -r 'if .required_pull_request_reviews then "true" else "false" end' 2>/dev/null || echo "false")
     if [[ "$has_pr" == "true" ]]; then
-      approvals=$(jq_val    "$prot" '.required_pull_request_reviews.required_approving_review_count')
-      dismiss=$(jq_val      "$prot" '.required_pull_request_reviews.dismiss_stale_reviews')
-      code_owners=$(jq_val  "$prot" '.required_pull_request_reviews.require_code_owner_reviews')
-      last_push=$(jq_val    "$prot" '.required_pull_request_reviews.require_last_push_approval')
-      bypass_teams=$(echo "$prot" | jq -r '[.required_pull_request_reviews.bypass_pull_request_allowances.teams[]?.slug] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
+      approvals=$(jq_val   "$prot" '.required_pull_request_reviews.required_approving_review_count')
+      dismiss=$(jq_val     "$prot" '.required_pull_request_reviews.dismiss_stale_reviews')
+      code_owners=$(jq_val "$prot" '.required_pull_request_reviews.require_code_owner_reviews')
+      last_push=$(jq_val   "$prot" '.required_pull_request_reviews.require_last_push_approval')
+      bypass_teams=$(echo  "$prot" | jq -r '[.required_pull_request_reviews.bypass_pull_request_allowances.teams[]?.slug] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
       echo -e "      ${DIM}Required PR reviews${RESET}"
       echo -e "        Approvals required       : ${BOLD}${approvals}${RESET}"
       echo -e "        Dismiss stale reviews    : $(bool_icon "$dismiss")"
