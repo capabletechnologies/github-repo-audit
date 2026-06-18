@@ -153,4 +153,89 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
         [[ -z "$rs_id" || "$rs_id" == "null" ]] && continue
         
         # Route logic specifically added to account for Organization vs Repository rulesets
-        local rs_endpoint="/repos/${owner_repo}/rulesets
+        local rs_endpoint="/repos/${owner_repo}/rulesets/${rs_id}"
+        [[ "$rs_type" == "Organization" ]] && rs_endpoint="/orgs/${rs_source}/rulesets/${rs_id}"
+
+        rs_detail=$(gh_api "$rs_endpoint" 2>/dev/null) || continue
+        rs_name=$(jq_val   "$rs_detail" '.name')
+        rs_enf=$(jq_val    "$rs_detail" '.enforcement')
+        rs_target=$(jq_val "$rs_detail" '.target')
+        rs_incl=$(printf '%s' "$rs_detail" | jq -r '[.conditions.ref_name.include[]?] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
+        rs_rules=$(printf '%s' "$rs_detail" | jq -r '[.rules[]?.type] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
+        echo ""
+        echo -e "   ${BOLD}${YELLOW}⚑  ${rs_name}${RESET}  ${DIM}[${rs_enf}, target: ${rs_target}, source: ${rs_type}]${RESET}"
+        echo -e "        Applies to refs          : ${rs_incl}"
+        echo -e "        Rules                    : ${rs_rules}"
+
+        pr_rule=$(printf '%s' "$rs_detail" | jq -c '.rules[]? | select(.type=="pull_request")' 2>/dev/null || true)
+        if [[ -n "$pr_rule" ]]; then
+          approvals=$(printf '%s' "$pr_rule" | jq -r '.parameters.required_approving_review_count // "—"' 2>/dev/null)
+          dismiss=$(printf '%s'   "$pr_rule" | jq -r '.parameters.dismiss_stale_reviews_on_push // false' 2>/dev/null)
+          codeowners=$(printf '%s' "$pr_rule" | jq -r '.parameters.require_code_owner_review // false' 2>/dev/null)
+          lastpush=$(printf '%s'  "$pr_rule" | jq -r '.parameters.require_last_push_approval // false' 2>/dev/null)
+          echo -e "        ${DIM}PR reviews${RESET}"
+          echo -e "          Approvals required     : ${BOLD}${approvals}${RESET}"
+          echo -e "          Dismiss stale reviews  : $(bool_icon "$dismiss")"
+          echo -e "          Require code owners    : $(bool_icon "$codeowners")"
+          echo -e "          Require last-push appr : $(bool_icon "$lastpush")"
+        fi
+
+        sc_rule=$(printf '%s' "$rs_detail" | jq -c '.rules[]? | select(.type=="required_status_checks")' 2>/dev/null || true)
+        if [[ -n "$sc_rule" ]]; then
+          checks=$(printf '%s' "$sc_rule" | jq -r '[.parameters.required_status_checks[]?.context] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
+          strict=$(printf '%s' "$sc_rule" | jq -r '.parameters.strict_required_status_checks_policy // false' 2>/dev/null)
+          echo -e "        ${DIM}Status checks${RESET}"
+          echo -e "          Strict (up-to-date)    : $(bool_icon "$strict")"
+          echo -e "          Checks                 : ${checks}"
+        fi
+      done < <(printf '%s' "$rulesets_json" | jq -r '.[] | "\(.id)|\(.source_type)|\(.source)"' 2>/dev/null)
+    else
+      echo -e "     ${DIM}No repository rulesets${RESET}"
+    fi
+  else
+    echo -e "     ${YELLOW}⚠  Could not fetch rulesets — $(cat /tmp/gh_err_$$)${RESET}"
+    rm -f /tmp/gh_err_$$
+  fi
+
+  # ── Classic branch protection ────────────────────────────────────────────────
+  echo -e "   ${GREEN}Classic branch protection:${RESET}"
+  protected_count=0
+  while IFS= read -r branch; do
+    [[ -z "${branch}" || "$branch" == "null" ]] && continue
+    if ! prot=$(gh_api "/repos/${owner_repo}/branches/${branch}/protection" 2>/tmp/gh_err_$$); then
+      [[ "$LAST_HTTP_CODE" == "404" ]] && { rm -f /tmp/gh_err_$$; continue; }
+      echo -e "      ${RED}⚠  ${branch}: $(cat /tmp/gh_err_$$)${RESET}"
+      rm -f /tmp/gh_err_$$
+      continue
+    fi
+    rm -f /tmp/gh_err_$$
+    protected_count=$((protected_count + 1))
+    echo ""
+    echo -e "   ${BOLD}${YELLOW}⚑  ${branch}${RESET}"
+
+    if [[ "$(printf '%s' "$prot" | jq -r 'has("required_pull_request_reviews")')" == "true" ]]; then
+      approvals=$(jq_val "$prot" '.required_pull_request_reviews.required_approving_review_count')
+      echo -e "        Approvals required       : ${BOLD}${approvals}${RESET}"
+    fi
+    enforce_admins=$(jq_val "$prot" '.enforce_admins.enabled')
+    force_pushes=$(jq_val   "$prot" '.allow_force_pushes.enabled')
+    allow_delete=$(jq_val   "$prot" '.allow_deletions.enabled')
+    echo -e "        Enforce for admins       : $(bool_icon "$enforce_admins")"
+    echo -e "        Allow force pushes       : $(bool_icon "$force_pushes")"
+    echo -e "        Allow deletions          : $(bool_icon "$allow_delete")"
+  done < <(printf '%s' "$branches_json" | jq -r '.[].name' 2>/dev/null)
+  [[ $protected_count -eq 0 ]] && echo -e "     ${DIM}No branches use classic protection${RESET}"
+
+  # ── Per-repo summary ─────────────────────────────────────────────────────────
+  echo ""
+  echo -e "   ${DIM}${ruleset_count:-0} ruleset(s), ${protected_count} classic-protected branch(es) of ${branch_count:-0}${RESET}"
+
+  success=$((success + 1))
+done < "$REPOS_FILE"
+
+echo ""
+separator
+echo -e "  ${BOLD}Audit complete${RESET}"
+echo -e "  Total: ${total}   ${GREEN}✓ Success: ${success}${RESET}   ${RED}✗ Failed: ${failed}${RESET}"
+separator
+echo ""
