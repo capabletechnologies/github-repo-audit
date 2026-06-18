@@ -44,8 +44,6 @@ gh_api() {
   local code body
 
   # Safely decouple HTTP code and JSON body using a local file to avoid stream corruption
-  # Using -k (insecure) to bypass corporate proxy SSL verification
-  # Using -sS to silence progress meter but show underlying curl errors
   code=$(curl -sS -k -L -w "%{http_code}" -o "$tmp_file" \
     -H "Authorization: Bearer ${GITHUB_TOKEN}" \
     -H "Accept: application/vnd.github+json" \
@@ -155,7 +153,7 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
         [[ -z "$rs_id" || "$rs_id" == "null" ]] && continue
         
         # Route logic specifically added to account for Organization vs Repository rulesets
-        local rs_endpoint="/repos/${owner_repo}/rulesets/${rs_id}"
+        rs_endpoint="/repos/${owner_repo}/rulesets/${rs_id}"
         [[ "$rs_type" == "Organization" ]] && rs_endpoint="/orgs/${rs_source}/rulesets/${rs_id}"
 
         rs_detail=$(gh_api "$rs_endpoint" 2>/dev/null) || continue
@@ -202,9 +200,15 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
   # ── Classic branch protection ────────────────────────────────────────────────
   echo -e "   ${GREEN}Classic branch protection:${RESET}"
   protected_count=0
+  
+  # Filter our initial 100-branch pull to ONLY include branches flagged as protected
   while IFS= read -r branch; do
     [[ -z "${branch}" || "$branch" == "null" ]] && continue
-    if ! prot=$(gh_api "/repos/${owner_repo}/branches/${branch}/protection" 2>/tmp/gh_err_$$); then
+    
+    # URL-encode special characters (like '#') but preserve slashes for the GitHub API path
+    safe_branch=$(jq -rn --arg x "$branch" '$x | @uri | gsub("%2F"; "/")')
+
+    if ! prot=$(gh_api "/repos/${owner_repo}/branches/${safe_branch}/protection" 2>/tmp/gh_err_$$); then
       [[ "$LAST_HTTP_CODE" == "404" ]] && { rm -f /tmp/gh_err_$$; continue; }
       echo -e "      ${RED}⚠  ${branch}: $(cat /tmp/gh_err_$$ 2>/dev/null || echo "Unknown error")${RESET}"
       rm -f /tmp/gh_err_$$
@@ -225,12 +229,14 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
     echo -e "        Enforce for admins       : $(bool_icon "$enforce_admins")"
     echo -e "        Allow force pushes       : $(bool_icon "$force_pushes")"
     echo -e "        Allow deletions          : $(bool_icon "$allow_delete")"
-  done < <(printf '%s' "$branches_json" | jq -r '.[].name' 2>/dev/null)
+  # This jq command drops the unprotected branches completely before the loop even starts
+  done < <(printf '%s' "$branches_json" | jq -r '.[] | select(.protected==true) | .name' 2>/dev/null)
+  
   [[ $protected_count -eq 0 ]] && echo -e "     ${DIM}No branches use classic protection${RESET}"
 
   # ── Per-repo summary ─────────────────────────────────────────────────────────
   echo ""
-  echo -e "   ${DIM}${ruleset_count:-0} ruleset(s), ${protected_count} classic-protected branch(es) of ${branch_count:-0}${RESET}"
+  echo -e "   ${DIM}${ruleset_count:-0} ruleset(s), ${protected_count} classic-protected branch(es) out of ${branch_count:-0} total branches${RESET}"
 
   success=$((success + 1))
 done < "$REPOS_FILE"
