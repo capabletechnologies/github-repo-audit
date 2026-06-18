@@ -44,7 +44,9 @@ gh_api() {
   local code body
 
   # Safely decouple HTTP code and JSON body using a local file to avoid stream corruption
-  code=$(curl -s -L -w "%{http_code}" -o "$tmp_file" \
+  # Using -k (insecure) to bypass corporate proxy SSL verification
+  # Using -sS to silence progress meter but show underlying curl errors
+  code=$(curl -sS -k -L -w "%{http_code}" -o "$tmp_file" \
     -H "Authorization: Bearer ${GITHUB_TOKEN}" \
     -H "Accept: application/vnd.github+json" \
     -H "X-GitHub-Api-Version: 2022-11-28" \
@@ -118,7 +120,7 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
 
   # ── Repo info ───────────────────────────────────────────────────────────────
   if ! repo_json=$(gh_api "/repos/${owner_repo}" 2>/tmp/gh_err_$$); then
-    echo -e "   ${RED}✗  Could not fetch repo — $(cat /tmp/gh_err_$$)${RESET}"
+    echo -e "   ${RED}✗  Could not fetch repo — $(cat /tmp/gh_err_$$ 2>/dev/null || echo "Unknown error")${RESET}"
     rm -f /tmp/gh_err_$$
     failed=$((failed + 1)); continue
   fi
@@ -130,7 +132,7 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
 
   # ── Branch list ─────────────────────────────────────────────────────────────
   if ! branches_json=$(gh_api "/repos/${owner_repo}/branches?per_page=100" 2>/tmp/gh_err_$$); then
-    echo -e "   ${YELLOW}⚠  Could not fetch branch list — $(cat /tmp/gh_err_$$)${RESET}"
+    echo -e "   ${YELLOW}⚠  Could not fetch branch list — $(cat /tmp/gh_err_$$ 2>/dev/null || echo "Unknown error")${RESET}"
     rm -f /tmp/gh_err_$$
     failed=$((failed + 1)); continue
   fi
@@ -193,7 +195,7 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
       echo -e "     ${DIM}No repository rulesets${RESET}"
     fi
   else
-    echo -e "     ${YELLOW}⚠  Could not fetch rulesets — $(cat /tmp/gh_err_$$)${RESET}"
+    echo -e "     ${YELLOW}⚠  Could not fetch rulesets — $(cat /tmp/gh_err_$$ 2>/dev/null || echo "Unknown error")${RESET}"
     rm -f /tmp/gh_err_$$
   fi
 
@@ -204,7 +206,7 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
     [[ -z "${branch}" || "$branch" == "null" ]] && continue
     if ! prot=$(gh_api "/repos/${owner_repo}/branches/${branch}/protection" 2>/tmp/gh_err_$$); then
       [[ "$LAST_HTTP_CODE" == "404" ]] && { rm -f /tmp/gh_err_$$; continue; }
-      echo -e "      ${RED}⚠  ${branch}: $(cat /tmp/gh_err_$$)${RESET}"
+      echo -e "      ${RED}⚠  ${branch}: $(cat /tmp/gh_err_$$ 2>/dev/null || echo "Unknown error")${RESET}"
       rm -f /tmp/gh_err_$$
       continue
     fi
