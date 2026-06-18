@@ -4,13 +4,21 @@
 # =============================================================================
 # Requirements: curl, jq
 # Auth:         export GITHUB_TOKEN=ghp_yourtoken
-# Usage:        ./github_branch_audit.sh [repos.txt]
+# Usage:        ./github_branch_audit.sh [repos.txt] [--debug]
 # Compatible:   Linux, macOS, Git Bash (Windows/MINGW64)
 # =============================================================================
 
 set -uo pipefail
 
-REPOS_FILE="${1:-repos.txt}"
+REPOS_FILE="repos.txt"
+DEBUG=0
+for arg in "$@"; do
+  case "$arg" in
+    --debug) DEBUG=1 ;;
+    *)       REPOS_FILE="$arg" ;;
+  esac
+done
+
 API_BASE="https://api.github.com"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -28,13 +36,11 @@ if [[ ! -f "$REPOS_FILE" ]]; then
   echo -e "${RED}Error:${RESET} Repos file not found: ${REPOS_FILE}"; exit 1
 fi
 
-# ── API helper ────────────────────────────────────────────────────────────────
-# Returns body on stdout, status code on fd 3 (so callers can branch on 404).
-# On HTTP >=400 it returns 1 but still emits the code via LAST_HTTP_CODE.
 LAST_HTTP_CODE=""
+LAST_BODY=""
 gh_api() {
   local endpoint="$1"
-  local sep="XHTTPCODE:"
+  local sep=$'\n__HTTPCODE__:'
   local raw http_code body msg
 
   raw=$(curl -s -w "${sep}%{http_code}" \
@@ -43,13 +49,20 @@ gh_api() {
     -H "X-GitHub-Api-Version: 2022-11-28" \
     "${API_BASE}${endpoint}" 2>/dev/null) || true
 
-  http_code="${raw##*${sep}}"
-  body="${raw%${sep}*}"
+  http_code="${raw##*__HTTPCODE__:}"
+  http_code="${http_code//[$'\r\n ']/}"
+  body="${raw%%$'\n'__HTTPCODE__:*}"
+
   LAST_HTTP_CODE="$http_code"
+  LAST_BODY="$body"
+
+  if [[ "$DEBUG" == "1" ]]; then
+    echo -e "      ${DIM}[debug] ${endpoint} -> HTTP ${http_code:-none}, body ${#body} bytes${RESET}" >&2
+  fi
 
   if [[ -z "$http_code" || ! "$http_code" =~ ^[0-9]+$ ]]; then
     LAST_HTTP_CODE="000"
-    echo "curl failed — check network connection" >&2
+    echo "curl failed / no HTTP code — check network or proxy" >&2
     return 1
   fi
   if [[ "$http_code" -ge 400 ]]; then
@@ -67,6 +80,19 @@ jq_val() {
   local result; result=$(printf '%s' "$1" | jq -r "${2} // empty" 2>/dev/null) || true
   echo "${result:-—}"
 }
+
+echo ""
+if me=$(gh_api "/user" 2>/tmp/gh_err); then
+  login=$(jq_val "$me" '.login')
+  echo -e "${DIM}Authenticated as: ${login}${RESET}"
+  scopes=$(curl -sI -H "Authorization: Bearer ${GITHUB_TOKEN}" "${API_BASE}/user" 2>/dev/null \
+    | tr -d '\r' | grep -i '^x-oauth-scopes:' | cut -d' ' -f2- || true)
+  [[ -n "${scopes:-}" ]] && echo -e "${DIM}Token scopes: ${scopes}${RESET}"
+else
+  echo -e "${RED}✗ Token check failed — $(cat /tmp/gh_err)${RESET}"
+  echo -e "${RED}  Your GITHUB_TOKEN is invalid or expired. Fix this first.${RESET}"
+  exit 1
+fi
 
 repo_count=0
 while IFS= read -r line || [[ -n "${line:-}" ]]; do
@@ -94,17 +120,32 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
   echo -e "${BOLD}${CYAN}▶  ${owner} / ${repo}${RESET}"
   echo -e "   ${DIM}${url}${RESET}"
 
-  # ── Repo info ───────────────────────────────────────────────────────────────
   if ! repo_json=$(gh_api "/repos/${owner_repo}" 2>/tmp/gh_err); then
-    echo -e "   ${RED}✗  Could not fetch repo — $(cat /tmp/gh_err)${RESET}"
+    err="$(cat /tmp/gh_err)"
+    echo -e "   ${RED}✗  Could not fetch repo — ${err}${RESET}"
+    if [[ "$LAST_HTTP_CODE" == "403" ]]; then
+      echo -e "   ${YELLOW}  → If this is a SAML-protected org, authorize your token for SSO:${RESET}"
+      echo -e "   ${YELLOW}    GitHub → Settings → Developer settings → Tokens → Configure SSO → Authorize${RESET}"
+    fi
     failed=$((failed + 1)); continue
   fi
 
   default_branch=$(jq_val "$repo_json" '.default_branch')
   visibility=$(jq_val     "$repo_json" '.visibility')
-  echo -e "   ${GREEN}Default branch :${RESET}  ${BOLD}${default_branch}${RESET}  ${DIM}[${visibility}]${RESET}"
 
-  # ── Branch list ─────────────────────────────────────────────────────────────
+  if [[ "$default_branch" == "—" ]]; then
+    echo -e "   ${RED}Default branch :${RESET}  ${RED}— (empty despite HTTP ${LAST_HTTP_CODE})${RESET}"
+    echo -e "   ${YELLOW}  → The API returned a repo object without 'default_branch'.${RESET}"
+    echo -e "   ${YELLOW}    Token likely lacks read access. Check: SSO authorization + 'repo'${RESET}"
+    echo -e "   ${YELLOW}    (classic) or 'Contents:Read'+'Administration:Read' (fine-grained).${RESET}"
+    if [[ "$DEBUG" == "1" ]]; then
+      echo -e "   ${DIM}[debug] repo JSON keys:${RESET}"
+      printf '%s' "$repo_json" | jq -r 'keys[]?' 2>/dev/null | sed 's/^/        /' | head -20
+    fi
+  else
+    echo -e "   ${GREEN}Default branch :${RESET}  ${BOLD}${default_branch}${RESET}  ${DIM}[${visibility}]${RESET}"
+  fi
+
   if ! branches_json=$(gh_api "/repos/${owner_repo}/branches?per_page=100" 2>/tmp/gh_err); then
     echo -e "   ${YELLOW}⚠  Could not fetch branch list — $(cat /tmp/gh_err)${RESET}"
     failed=$((failed + 1)); continue
@@ -119,10 +160,9 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
   while IFS= read -r branch; do
     [[ -z "${branch}" ]] && continue
 
-    # Distinguish 404 (unprotected) from real errors (403 token scope, etc.)
     if ! prot=$(gh_api "/repos/${owner_repo}/branches/${branch}/protection" 2>/tmp/gh_err); then
       if [[ "$LAST_HTTP_CODE" == "404" ]]; then
-        continue  # genuinely unprotected — skip quietly
+        continue
       fi
       echo -e "      ${RED}⚠  ${branch}: $(cat /tmp/gh_err)${RESET}"
       continue
@@ -132,7 +172,6 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
     echo ""
     echo -e "   ${BOLD}${YELLOW}⚑  ${branch}${RESET}"
 
-    # Required status checks
     if [[ "$(printf '%s' "$prot" | jq -r 'has("required_status_checks")')" == "true" ]]; then
       strict=$(jq_val "$prot" '.required_status_checks.strict')
       contexts=$(printf '%s' "$prot" | jq -r '[.required_status_checks.contexts[]?] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
@@ -145,7 +184,6 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
       echo -e "      ${DIM}Required status checks   : —${RESET}"
     fi
 
-    # Required PR reviews
     if [[ "$(printf '%s' "$prot" | jq -r 'has("required_pull_request_reviews")')" == "true" ]]; then
       approvals=$(jq_val   "$prot" '.required_pull_request_reviews.required_approving_review_count')
       dismiss=$(jq_val     "$prot" '.required_pull_request_reviews.dismiss_stale_reviews')
@@ -168,8 +206,6 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
     linear=$(jq_val         "$prot" '.required_linear_history.enabled')
     conv_res=$(jq_val       "$prot" '.required_conversation_resolution.enabled')
     signed=$(jq_val         "$prot" '.required_signatures.enabled')
-
-    # required_signatures is often absent from the protection payload — fetch it
     if [[ "$signed" == "—" ]]; then
       sig_json=$(gh_api "/repos/${owner_repo}/branches/${branch}/protection/required_signatures" 2>/dev/null) || sig_json=""
       signed=$(jq_val "$sig_json" '.enabled')
