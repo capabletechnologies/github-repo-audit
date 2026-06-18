@@ -47,7 +47,7 @@ fi
 # Works with both Git Bash (Windows curl.exe) and Linux/macOS curl.
 gh_api() {
   local endpoint="$1"
-  local sep="@@HTTPCODE@@"
+  local sep="XHTTPCODE:"   # must NOT start with @ — Windows curl treats -w "@..." as read-from-file
   local raw http_code body msg
 
   raw=$(curl -s -w "${sep}%{http_code}" \
