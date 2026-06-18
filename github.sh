@@ -43,28 +43,35 @@ fi
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+# No temp files — appends a unique delimiter + HTTP code to the response body.
+# Works with both Git Bash (Windows curl.exe) and Linux/macOS curl.
 gh_api() {
-  # On success:    prints JSON to stdout, returns 0
-  # On HTTP error: prints GitHub's own error message to stderr, returns 1
   local endpoint="$1"
-  local tmpfile
-  tmpfile=$(mktemp)
-  local http_code
-  http_code=$(curl -s -o "$tmpfile" -w "%{http_code}" \
+  local sep="@@HTTPCODE@@"
+  local raw http_code body msg
+
+  raw=$(curl -s -w "${sep}%{http_code}" \
     -H "Authorization: Bearer ${GITHUB_TOKEN}" \
     -H "Accept: application/vnd.github+json" \
     -H "X-GitHub-Api-Version: 2022-11-28" \
-    "${API_BASE}${endpoint}")
-  local body
-  body=$(cat "$tmpfile")
-  rm -f "$tmpfile"
+    "${API_BASE}${endpoint}" 2>/dev/null) || true
+
+  # Split on the delimiter — everything after last occurrence is the status code
+  http_code="${raw##*${sep}}"
+  body="${raw%${sep}*}"
+
+  if [[ -z "$http_code" ]]; then
+    echo "curl failed — check network connection" >&2
+    return 1
+  fi
+
   if [[ "$http_code" -ge 400 ]]; then
-    local msg
-    msg=$(echo "$body" | jq -r '.message // empty' 2>/dev/null || true)
+    msg=$(printf '%s' "$body" | jq -r '.message // empty' 2>/dev/null || true)
     echo "HTTP ${http_code}${msg:+ — ${msg}}" >&2
     return 1
   fi
-  echo "$body"
+
+  printf '%s' "$body"
 }
 
 extract_owner_repo() {
@@ -87,7 +94,7 @@ bool_icon() {
 jq_val() {
   local json="$1" filter="$2"
   local result
-  result=$(echo "$json" | jq -r "${filter} // empty" 2>/dev/null) || true
+  result=$(printf '%s' "$json" | jq -r "${filter} // empty" 2>/dev/null) || true
   echo "${result:-—}"
 }
 
@@ -130,14 +137,7 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
   api_err=""
   if ! repo_json=$(gh_api "/repos/${owner_repo}" 2>/tmp/gh_err); then
     api_err=$(cat /tmp/gh_err 2>/dev/null || true)
-    echo -e "   ${RED}✗  Could not fetch repo${RESET}"
-    echo -e "   ${RED}   ${api_err}${RESET}"
-    # Hint for the most common enterprise issue
-    if echo "$api_err" | grep -qi "403\|resource protected by organization SAML\|must grant your OAuth token"; then
-      echo -e "   ${YELLOW}   ➜  Your token needs SSO authorisation for this org.${RESET}"
-      echo -e "   ${YELLOW}      github.com → Settings → Developer settings → Personal access tokens${RESET}"
-      echo -e "   ${YELLOW}      → find your token → click \"Configure SSO\" → Authorize for this org${RESET}"
-    fi
+    echo -e "   ${RED}✗  Could not fetch repo — ${api_err}${RESET}"
     failed=$((failed + 1))
     continue
   fi
@@ -156,7 +156,7 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
     continue
   fi
 
-  branch_count=$(echo "$branches_json" | jq 'length' 2>/dev/null || echo "?")
+  branch_count=$(printf '%s' "$branches_json" | jq 'length' 2>/dev/null || echo "?")
   echo -e "   ${GREEN}Total branches :${RESET}  ${branch_count}"
 
   # ── Protection rules ─────────────────────────────────────────────────────────
@@ -176,11 +176,11 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
     echo -e "   ${BOLD}${YELLOW}⚑  ${branch}${RESET}"
 
     # Required status checks
-    has_checks=$(echo "$prot" | jq -r 'if .required_status_checks then "true" else "false" end' 2>/dev/null || echo "false")
+    has_checks=$(printf '%s' "$prot" | jq -r 'if .required_status_checks then "true" else "false" end' 2>/dev/null || echo "false")
     if [[ "$has_checks" == "true" ]]; then
       strict=$(jq_val "$prot" '.required_status_checks.strict')
-      contexts=$(echo "$prot" | jq -r '[.required_status_checks.contexts[]?] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
-      checks=$(echo   "$prot" | jq -r '[.required_status_checks.checks[]?.context] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
+      contexts=$(printf '%s' "$prot" | jq -r '[.required_status_checks.contexts[]?] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
+      checks=$(printf '%s' "$prot"   | jq -r '[.required_status_checks.checks[]?.context] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
       echo -e "      ${DIM}Required status checks${RESET}"
       echo -e "        Strict (up-to-date)      : $(bool_icon "$strict")"
       echo -e "        Contexts                 : ${contexts}"
@@ -190,13 +190,13 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
     fi
 
     # Required PR reviews
-    has_pr=$(echo "$prot" | jq -r 'if .required_pull_request_reviews then "true" else "false" end' 2>/dev/null || echo "false")
+    has_pr=$(printf '%s' "$prot" | jq -r 'if .required_pull_request_reviews then "true" else "false" end' 2>/dev/null || echo "false")
     if [[ "$has_pr" == "true" ]]; then
       approvals=$(jq_val   "$prot" '.required_pull_request_reviews.required_approving_review_count')
       dismiss=$(jq_val     "$prot" '.required_pull_request_reviews.dismiss_stale_reviews')
       code_owners=$(jq_val "$prot" '.required_pull_request_reviews.require_code_owner_reviews')
       last_push=$(jq_val   "$prot" '.required_pull_request_reviews.require_last_push_approval')
-      bypass_teams=$(echo  "$prot" | jq -r '[.required_pull_request_reviews.bypass_pull_request_allowances.teams[]?.slug] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
+      bypass_teams=$(printf '%s' "$prot" | jq -r '[.required_pull_request_reviews.bypass_pull_request_allowances.teams[]?.slug] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
       echo -e "      ${DIM}Required PR reviews${RESET}"
       echo -e "        Approvals required       : ${BOLD}${approvals}${RESET}"
       echo -e "        Dismiss stale reviews    : $(bool_icon "$dismiss")"
@@ -224,11 +224,11 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
     echo -e "        Resolve conversations    : $(bool_icon "$conv_res")"
 
     # Push restrictions
-    has_restrictions=$(echo "$prot" | jq -r 'if .restrictions then "true" else "false" end' 2>/dev/null || echo "false")
+    has_restrictions=$(printf '%s' "$prot" | jq -r 'if .restrictions then "true" else "false" end' 2>/dev/null || echo "false")
     if [[ "$has_restrictions" == "true" ]]; then
-      r_users=$(echo "$prot" | jq -r '[.restrictions.users[]?.login] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
-      r_teams=$(echo "$prot" | jq -r '[.restrictions.teams[]?.slug]  | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
-      r_apps=$(echo  "$prot" | jq -r '[.restrictions.apps[]?.slug]   | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
+      r_users=$(printf '%s' "$prot" | jq -r '[.restrictions.users[]?.login] | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
+      r_teams=$(printf '%s' "$prot" | jq -r '[.restrictions.teams[]?.slug]  | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
+      r_apps=$(printf '%s'  "$prot" | jq -r '[.restrictions.apps[]?.slug]   | if length>0 then join(", ") else "—" end' 2>/dev/null || echo "—")
       echo -e "      ${DIM}Push restrictions${RESET}"
       echo -e "        Users                    : ${r_users}"
       echo -e "        Teams                    : ${r_teams}"
@@ -237,7 +237,7 @@ while IFS= read -r url || [[ -n "${url:-}" ]]; do
       echo -e "      ${DIM}Push restrictions        : — (unrestricted)${RESET}"
     fi
 
-  done < <(echo "$branches_json" | jq -r '.[].name' 2>/dev/null)
+  done < <(printf '%s' "$branches_json" | jq -r '.[].name' 2>/dev/null)
 
   if [[ $protected_count -eq 0 ]]; then
     echo -e "     ${DIM}No branches have protection rules${RESET}"
